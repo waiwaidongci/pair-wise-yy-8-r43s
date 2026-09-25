@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { judgeWithdrawal, pulpSummary } from "./src/withdrawal.js";
+import { placeWithdrawal, archiveSheet, recordReturn, reviewReturn, revokeWithdrawal, changeWeight } from "./src/archive.js";
+import { page } from "./src/page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "paper-pulp-fermentation.json");
@@ -24,13 +27,26 @@ const seed = {
           "abnormal": false
         }
       ]
+    },
+    {
+      "code": "PF-002",
+      "source": "楮皮",
+      "vat": "一号缸",
+      "days": 9,
+      "owner": "林素",
+      "weight": 120,
+      "status": "可抄纸",
+      "logs": [
+        {
+          "at": "2026-06-10",
+          "step": "状态",
+          "note": "发酵完成，原重量120kg，转可抄纸"
+        }
+      ]
     }
   ]
 };
-const fields = [["code","批次编号","text"],["source","原料来源","text"],["vat","浸泡缸","text"],["days","发酵天数","number"],["owner","负责人","text"]];
-const stages = ["入缸","发酵中","可抄纸","异常观察"];
-const statLabels = ["入缸","发酵中","可抄纸","异常观察"];
-const extraFields = [["temperature","温度"],["smell","气味状态"],["fiber","纤维松散度"],["changedWater","是否换水"],["abnormal","异味或霉点"]];
+const statLabels = ["入缸", "发酵中", "可抄纸", "异常观察"];
 
 async function loadDb() {
   if (!existsSync(dbPath)) {
@@ -63,89 +79,10 @@ function computeStats(items) {
 }
 function summarize(item) {
   const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
+  return { ...item, logCount, pulp: pulpSummary(item) };
 }
-function page() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>古法纸浆发酵记录</title>
-  <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>古法纸浆发酵记录</h1><div class="meta">纸浆批次、浸泡缸、换水和异常观察</div></div><button id="reload">刷新</button></header>
-  <main>
-    <section>
-      <form id="createForm"><h2>新增纸浆批次</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存纸浆批次</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>每日观察记录</h2><label>选择纸浆批次</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
-    </section>
-    <section>
-      <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>每天记录温度、气味、纤维状态和换水情况，系统统计发酵进度与异常次数。</h2><div class="grid" id="cards"></div></div>
-    </section>
-  </main>
-  <script>
-    const fields = [["code","批次编号","text"],["source","原料来源","text"],["vat","浸泡缸","text"],["days","发酵天数","number"],["owner","负责人","text"]];
-    const stages = ["入缸","发酵中","可抄纸","异常观察"];
-    const extraFields = [["temperature","温度"],["smell","气味状态"],["fiber","纤维松散度"],["changedWater","是否换水"],["abnormal","异味或霉点"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
-      return data;
-    }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
-    }
-    function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
-    }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
-    }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
-  </script>
-</body>
-</html>`;
+function findItem(db, key) {
+  return db.items.find(x => x.id === key || x.code === key);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -157,16 +94,23 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
       const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建纸浆批次" }] };
-      
+
       db.items.unshift(item);
       await saveDb(db);
       return send(res, 201, item);
     }
     const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
+      const item = findItem(db, patch[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
+      const input = await body(req);
+      if (input.weight !== undefined) {
+        const result = changeWeight(item, input.weight, input.operator);
+        if (result.error) return send(res, 400, result);
+      }
+      delete input.weight;
+      delete input.operator;
+      Object.assign(item, input);
       item.logs ||= [];
       item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
       await saveDb(db);
@@ -174,7 +118,7 @@ const server = http.createServer(async (req, res) => {
     }
     const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
     if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
+      const item = findItem(db, log[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
       item.logs ||= [];
@@ -184,7 +128,7 @@ const server = http.createServer(async (req, res) => {
     }
     const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
     if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
+      const item = findItem(db, action[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
       item.logs ||= [];
@@ -197,10 +141,76 @@ const server = http.createServer(async (req, res) => {
       await saveDb(db);
       return send(res, 201, item);
     }
+    // 抄纸领用：先过领用判定，拒绝则原记录不动
+    const withdraw = url.pathname.match(/^\/api\/items\/([^/]+)\/withdrawals$/);
+    if (withdraw && req.method === "POST") {
+      const item = findItem(db, withdraw[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const input = await body(req);
+      const verdict = judgeWithdrawal(item, input);
+      if (!verdict.ok) return send(res, 409, { error: verdict.reason });
+      const { withdrawal } = placeWithdrawal(item, input);
+      await saveDb(db);
+      return send(res, 201, { withdrawal, pulp: pulpSummary(item) });
+    }
+    // 逐帘存档：成品入档，破帘/异物转返浆
+    const sheet = url.pathname.match(/^\/api\/items\/([^/]+)\/withdrawals\/([^/]+)\/sheets$/);
+    if (sheet && req.method === "POST") {
+      const item = findItem(db, sheet[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const result = archiveSheet(item, sheet[2], await body(req));
+      if (result.error) return send(res, 400, result);
+      await saveDb(db);
+      return send(res, 201, result);
+    }
+    // 撤回领用：关联成品与余浆记录失效重算
+    const revoke = url.pathname.match(/^\/api\/items\/([^/]+)\/withdrawals\/([^/]+)\/revoke$/);
+    if (revoke && req.method === "POST") {
+      const item = findItem(db, revoke[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const input = await body(req);
+      const result = revokeWithdrawal(item, revoke[2], input.operator);
+      if (result.error) return send(res, 400, result);
+      await saveDb(db);
+      return send(res, 200, { ...result, pulp: pulpSummary(item) });
+    }
+    // 余浆称重回缸：挂待复核，复核前不释放余量
+    const ret = url.pathname.match(/^\/api\/items\/([^/]+)\/returns$/);
+    if (ret && req.method === "POST") {
+      const item = findItem(db, ret[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const result = recordReturn(item, await body(req));
+      if (result.error) return send(res, 400, result);
+      await saveDb(db);
+      return send(res, 201, { ...result, pulp: pulpSummary(item) });
+    }
+    // 回缸复核：须另一人，通过后释放余量、恢复领用
+    const review = url.pathname.match(/^\/api\/items\/([^/]+)\/returns\/([^/]+)\/review$/);
+    if (review && req.method === "POST") {
+      const item = findItem(db, review[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      const input = await body(req);
+      const result = reviewReturn(item, review[2], input.reviewer);
+      if (result.error) return send(res, 400, result);
+      await saveDb(db);
+      return send(res, 200, { ...result, pulp: pulpSummary(item) });
+    }
+    // 旧履历：失效重算记录与旧快照可查
+    const history = url.pathname.match(/^\/api\/items\/([^/]+)\/history$/);
+    if (history && req.method === "GET") {
+      const item = findItem(db, history[1]);
+      if (!item) return send(res, 404, { error: "item_not_found" });
+      return send(res, 200, {
+        history: item.history || [],
+        products: item.products || [],
+        returns: item.returns || [],
+        withdrawals: item.withdrawals || []
+      });
+    }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
     send(res, 404, { error: "not_found" });
   } catch (error) {
     send(res, 500, { error: error.message });
   }
 });
-server.listen(port, () => console.log("古法纸浆发酵记录 listening on http://localhost:" + port));
+server.listen(port, () => console.log("古法纸浆发酵与抄纸记录 listening on http://localhost:" + port));
